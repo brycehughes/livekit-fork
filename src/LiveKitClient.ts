@@ -1,3 +1,31 @@
+/*
+ * Usage Example for Virtual Audio (External Participants):
+ * 
+ * // 1. Initialize the client for external participant support
+ * liveKitClient.initializeExternalParticipantSupport();
+ * 
+ * // 2. Connect to the LiveKit room as usual
+ * await liveKitClient.liveKitRoom?.connect(serverUrl, accessToken);
+ * 
+ * // 3. The client will automatically handle external participants and create virtual audio elements
+ * 
+ * // 4. Control external participant audio
+ * liveKitClient.setVirtualAudioVolume("participant-id", 0.8);
+ * liveKitClient.setVirtualAudioMuted("participant-id", false);
+ * 
+ * // 5. Get external participants
+ * const externalParticipants = liveKitClient.getExternalParticipants();
+ * 
+ * // 6. Manually subscribe to tracks if needed
+ * const participant = liveKitClient.getExternalParticipant("participant-id");
+ * if (participant) {
+ *   await liveKitClient.subscribeToAllTracks(participant);
+ * }
+ * 
+ * // 7. Clean up when done
+ * liveKitClient.cleanupAllVirtualAudio();
+ */
+
 import {
   AudioCaptureOptions,
   ConnectionQuality,
@@ -63,6 +91,11 @@ export default class LiveKitClient {
   useExternalAV = false;
   videoTrack: LocalVideoTrack | null = null;
   windowClickListener: EventListener | null = null;
+
+  // Add support for virtual audio elements and external participants
+  virtualAudioElements: Map<string, HTMLAudioElement> = new Map();
+  externalParticipants: Map<string, RemoteParticipant> = new Map();
+  enableVirtualAudio = false;
 
   liveKitServerTypes: LiveKitServerTypes = {
     custom: {
@@ -929,77 +962,129 @@ export default class LiveKitClient {
 
     const fvttUser = this.getParticipantFVTTUser(participant);
 
-    if (!fvttUser?.id) {
-      log.error(
-        "Joining participant",
-        participant,
-        "is not an FVTT user; cannot display them"
+    // Handle FVTT users
+    if (fvttUser?.id) {
+      if (!fvttUser.active) {
+        // Force the user to be active. If they are signing in to meeting, they should be online.
+        log.warn(
+          "Joining user",
+          fvttUser.id,
+          "is not listed as active. Setting to active."
+        );
+        fvttUser.active = true;
+        ui.players?.render();
+      }
+
+      // Save the participant to the ID mapping
+      this.liveKitParticipants.set(fvttUser.id, participant);
+
+      // Clear breakout room cache if user is joining the main conference
+      if (!this.breakoutRoom) {
+        this.settings.set(
+          "client",
+          `users.${fvttUser.id}.liveKitBreakoutRoom`,
+          ""
+        );
+      }
+
+      // Set up remote participant callbacks
+      this.setRemoteParticipantCallbacks(participant);
+
+      participant.tracks.forEach((publication) => {
+        this.onTrackPublished(publication, participant);
+      });
+
+      // Call a debounced render
+      this.render();
+      return;
+    }
+
+    // Handle external participants when virtual audio mode is enabled
+    if (this.enableVirtualAudio) {
+      log.debug(
+        "External participant connected:",
+        participant.identity
+      );
+
+      // Store external participant
+      this.externalParticipants.set(participant.identity, participant);
+
+      // Set up remote participant callbacks for external participants too
+      this.setRemoteParticipantCallbacks(participant);
+
+      // Handle any existing tracks
+      participant.tracks.forEach((publication) => {
+        this.onTrackPublished(publication, participant);
+      });
+
+      log.debug(
+        "Successfully handled external participant connection:",
+        participant.identity
       );
       return;
     }
 
-    if (!fvttUser.active) {
-      // Force the user to be active. If they are signing in to meeting, they should be online.
-      log.warn(
-        "Joining user",
-        fvttUser.id,
-        "is not listed as active. Setting to active."
-      );
-      fvttUser.active = true;
-      ui.players?.render();
-    }
-
-    // Save the participant to the ID mapping
-    this.liveKitParticipants.set(fvttUser.id, participant);
-
-    // Clear breakout room cache if user is joining the main conference
-    if (!this.breakoutRoom) {
-      this.settings.set(
-        "client",
-        `users.${fvttUser.id}.liveKitBreakoutRoom`,
-        ""
-      );
-    }
-
-    // Set up remote participant callbacks
-    this.setRemoteParticipantCallbacks(participant);
-
-    participant.tracks.forEach((publication) => {
-      this.onTrackPublished(publication, participant);
-    });
-
-    // Call a debounced render
-    this.render();
+    // Fallback: log unhandled participant
+    log.warn(
+      "Joining participant",
+      participant,
+      "is not an FVTT user and virtual audio mode is disabled"
+    );
   }
 
   onParticipantDisconnected(participant: RemoteParticipant): void {
     log.debug("onParticipantDisconnected:", participant);
 
-    // Remove the participant from the ID mapping
+    // Handle FVTT users
     const fvttUserId = this.getParticipantFVTTUser(participant)?.id;
+    if (fvttUserId) {
+      // Remove the participant from the ID mapping
+      this.liveKitParticipants.delete(fvttUserId);
 
-    if (!fvttUserId) {
-      log.warn("Leaving participant", participant, "is not an FVTT user");
+      // Clear breakout room cache if user is leaving a breakout room
+      if (
+        this.settings.get("client", `users.${fvttUserId}.liveKitBreakoutRoom`) ===
+          this.liveKitAvClient.room &&
+        this.liveKitAvClient.room === this.breakoutRoom
+      ) {
+        this.settings.set(
+          "client",
+          `users.${fvttUserId}.liveKitBreakoutRoom`,
+          ""
+        );
+      }
+
+      // Call a debounced render
+      this.render();
       return;
     }
 
-    this.liveKitParticipants.delete(fvttUserId);
-
-    // Clear breakout room cache if user is leaving a breakout room
-    if (
-      this.settings.get("client", `users.${fvttUserId}.liveKitBreakoutRoom`) ===
-        this.liveKitAvClient.room &&
-      this.liveKitAvClient.room === this.breakoutRoom
-    ) {
-      this.settings.set(
-        "client",
-        `users.${fvttUserId}.liveKitBreakoutRoom`,
-        ""
+    // Handle external participants
+    if (this.externalParticipants.has(participant.identity)) {
+      log.debug(
+        "External participant disconnected:",
+        participant.identity
       );
+
+      // Clean up virtual audio elements
+      this.cleanupVirtualAudioElements(participant.identity);
+
+      // Remove from external participants map
+      this.externalParticipants.delete(participant.identity);
+
+      log.debug(
+        "Successfully cleaned up external participant:",
+        participant.identity
+      );
+      return;
     }
 
-    // Call a debounced render
-    this.render();
+    // Fallback: log unhandled participant
+    log.warn(
+      "Leaving participant", 
+      participant, 
+      "was not found in FVTT users or external participants"
+    );
   }
 
   onReconnected(): void {
@@ -1161,42 +1246,85 @@ export default class LiveKitClient {
     log.debug("onTrackSubscribed:", track, publication, participant);
     const fvttUserId = this.getParticipantFVTTUser(participant)?.id;
 
-    if (!fvttUserId) {
-      log.warn(
-        "Track subscribed participant",
-        participant,
-        "is not an FVTT user"
-      );
-      return;
-    }
+    // Handle FVTT users with UI elements
+    if (fvttUserId) {
+      const videoElement = ui.webrtc?.getUserVideoElement(fvttUserId);
 
-    const videoElement = ui.webrtc?.getUserVideoElement(fvttUserId);
-
-    if (!videoElement) {
-      log.debug(
-        "videoElement not yet ready for",
-        fvttUserId,
-        "; skipping publication",
-        publication
-      );
-      return;
-    }
-
-    if (track instanceof RemoteAudioTrack) {
-      // Get the audio element for the user
-      const audioElement = this.getUserAudioElement(
-        fvttUserId,
-        videoElement,
-        publication.source
-      );
-      if (audioElement) {
-        await this.attachAudioTrack(fvttUserId, track, audioElement);
+      if (!videoElement) {
+        log.debug(
+          "videoElement not yet ready for",
+          fvttUserId,
+          "; skipping publication",
+          publication
+        );
+        return;
       }
-    } else if (track instanceof RemoteVideoTrack) {
-      this.attachVideoTrack(track, videoElement);
-    } else {
-      log.warn("Unknown track type subscribed from publication", publication);
+
+      if (track instanceof RemoteAudioTrack) {
+        // Get the audio element for the user
+        const audioElement = this.getUserAudioElement(
+          fvttUserId,
+          videoElement,
+          publication.source
+        );
+        if (audioElement) {
+          await this.attachAudioTrack(fvttUserId, track, audioElement);
+        }
+      } else if (track instanceof RemoteVideoTrack) {
+        this.attachVideoTrack(track, videoElement);
+      } else {
+        log.warn("Unknown track type subscribed from publication", publication);
+      }
+      return;
     }
+
+    // Handle external participants (non-FVTT users) with virtual audio mode
+    if (this.enableVirtualAudio) {
+      log.debug(
+        "Handling external participant track subscription:",
+        participant.identity
+      );
+
+      // Store external participant for reference
+      this.externalParticipants.set(participant.identity, participant);
+
+      if (track instanceof RemoteAudioTrack) {
+        // Create or get virtual audio element
+        const virtualAudioElement = this.createVirtualAudioElement(
+          participant.identity,
+          publication.source
+        );
+        
+        // Attach the audio track to the virtual element
+        await this.attachVirtualAudioTrack(
+          participant.identity,
+          track,
+          virtualAudioElement
+        );
+        
+        log.debug(
+          "Successfully attached external participant audio track:",
+          participant.identity
+        );
+      } else if (track instanceof RemoteVideoTrack) {
+        // For external participants, we might not need video display
+        // but you can extend this if needed
+        log.debug(
+          "Video track from external participant - not attaching to UI:",
+          participant.identity
+        );
+      } else {
+        log.warn("Unknown track type subscribed from external participant", publication);
+      }
+      return;
+    }
+
+    // Fallback: warn about unhandled participant
+    log.warn(
+      "Track subscribed participant",
+      participant,
+      "is not an FVTT user and virtual audio mode is disabled"
+    );
   }
 
   onTrackUnSubscribed(
@@ -1543,5 +1671,255 @@ export default class LiveKitClient {
     }
 
     return trackPublishOptions;
+  }
+
+  /**
+   * Creates a virtual audio element for playing audio without UI dependencies
+   * @param participantId - The participant ID
+   * @param audioType - The audio track source type
+   * @returns HTMLAudioElement for audio playback
+   */
+  createVirtualAudioElement(
+    participantId: string,
+    audioType: Track.Source = Track.Source.Microphone
+  ): HTMLAudioElement {
+    const audioElementId = `${participantId}-${audioType}`;
+    
+    // Return existing element if available
+    if (this.virtualAudioElements.has(audioElementId)) {
+      return this.virtualAudioElements.get(audioElementId)!;
+    }
+
+    // Create new virtual audio element
+    const audioElement = document.createElement("audio");
+    audioElement.autoplay = true;
+    audioElement.volume = 1.0;
+    audioElement.id = audioElementId;
+    
+    // Store the element for later use
+    this.virtualAudioElements.set(audioElementId, audioElement);
+    
+    log.debug("Created virtual audio element for participant:", participantId);
+    return audioElement;
+  }
+
+  /**
+   * Attach audio track to a virtual element without FVTT user requirements
+   * @param participantId - The participant ID
+   * @param userAudioTrack - The remote audio track
+   * @param audioElement - The audio element to attach to
+   */
+  async attachVirtualAudioTrack(
+    participantId: string,
+    userAudioTrack: RemoteAudioTrack,
+    audioElement: HTMLAudioElement
+  ): Promise<void> {
+    if (userAudioTrack.attachedElements.includes(audioElement)) {
+      log.debug(
+        "Audio track",
+        userAudioTrack,
+        "already attached to virtual element",
+        audioElement,
+        "; skipping"
+      );
+      return;
+    }
+
+    // Set audio output device (optional for virtual elements)
+    if (audioElement.sinkId !== undefined) {
+      const requestedSink = this.settings.get("client", "audioSink");
+      // @ts-expect-error - setSinkId is currently an experimental method and not in the defined types
+      await audioElement.setSinkId(requestedSink).catch((error: unknown) => {
+        let message = error;
+        if (error instanceof Error) {
+          message = error.message;
+        }
+        log.warn(
+          "Could not set audio sink for virtual element:",
+          requestedSink,
+          message
+        );
+      });
+    }
+
+    // Detach from any existing elements
+    userAudioTrack.detach();
+
+    // Attach the audio track
+    userAudioTrack.attach(audioElement);
+
+    // Set default volume and mute state
+    audioElement.volume = 1.0;
+    audioElement.muted = this.settings.get("client", "muteAll") === true;
+    
+    log.debug("Attached audio track to virtual element for participant:", participantId);
+  }
+
+  /**
+   * Enable virtual audio mode for handling non-FVTT participants
+   * @param enabled - Whether to enable virtual audio mode
+   */
+  setVirtualAudioMode(enabled: boolean): void {
+    this.enableVirtualAudio = enabled;
+    log.debug("Virtual audio mode", enabled ? "enabled" : "disabled");
+  }
+
+  /**
+   * Subscribe to a specific track manually (useful for external participants)
+   * @param publication - The track publication to subscribe to
+   * @param participant - The participant who owns the track
+   */
+  async subscribeToTrack(
+    publication: RemoteTrackPublication,
+    participant: RemoteParticipant
+  ): Promise<void> {
+    if (!publication.isSubscribed) {
+      publication.setSubscribed(true);
+      log.debug("Manually subscribed to track:", publication, "for participant:", participant);
+    }
+  }
+
+  /**
+   * Get virtual audio element for a participant
+   * @param participantId - The participant ID
+   * @param audioType - The audio track source type
+   * @returns HTMLAudioElement or null
+   */
+  getVirtualAudioElement(
+    participantId: string,
+    audioType: Track.Source = Track.Source.Microphone
+  ): HTMLAudioElement | null {
+    const audioElementId = `${participantId}-${audioType}`;
+    return this.virtualAudioElements.get(audioElementId) || null;
+  }
+
+  /**
+   * Clean up virtual audio elements for a participant
+   * @param participantId - The participant ID to clean up
+   */
+  cleanupVirtualAudioElements(participantId: string): void {
+    const elementsToRemove: string[] = [];
+    
+    this.virtualAudioElements.forEach((element, elementId) => {
+      if (elementId.startsWith(participantId)) {
+        element.pause();
+        element.src = "";
+        elementsToRemove.push(elementId);
+      }
+    });
+    
+    elementsToRemove.forEach(elementId => {
+      this.virtualAudioElements.delete(elementId);
+    });
+    
+    log.debug("Cleaned up virtual audio elements for participant:", participantId);
+  }
+
+  /**
+   * Get all external participants (non-FVTT users)
+   * @returns Map of external participants
+   */
+  getExternalParticipants(): Map<string, RemoteParticipant> {
+    return new Map(this.externalParticipants);
+  }
+
+  /**
+   * Get a specific external participant by identity
+   * @param participantIdentity - The participant identity
+   * @returns RemoteParticipant or undefined
+   */
+  getExternalParticipant(participantIdentity: string): RemoteParticipant | undefined {
+    return this.externalParticipants.get(participantIdentity);
+  }
+
+  /**
+   * Get all virtual audio elements
+   * @returns Map of virtual audio elements
+   */
+  getVirtualAudioElements(): Map<string, HTMLAudioElement> {
+    return new Map(this.virtualAudioElements);
+  }
+
+  /**
+   * Set volume for a virtual audio element
+   * @param participantId - The participant ID
+   * @param volume - Volume level (0.0 to 1.0)
+   * @param audioType - The audio track source type
+   */
+  setVirtualAudioVolume(
+    participantId: string, 
+    volume: number, 
+    audioType: Track.Source = Track.Source.Microphone
+  ): void {
+    const audioElement = this.getVirtualAudioElement(participantId, audioType);
+    if (audioElement) {
+      audioElement.volume = Math.max(0, Math.min(1, volume));
+      log.debug(`Set volume for ${participantId} to ${volume}`);
+    } else {
+      log.warn(`No virtual audio element found for participant: ${participantId}`);
+    }
+  }
+
+  /**
+   * Mute/unmute a virtual audio element
+   * @param participantId - The participant ID
+   * @param muted - Whether to mute the audio
+   * @param audioType - The audio track source type
+   */
+  setVirtualAudioMuted(
+    participantId: string, 
+    muted: boolean, 
+    audioType: Track.Source = Track.Source.Microphone
+  ): void {
+    const audioElement = this.getVirtualAudioElement(participantId, audioType);
+    if (audioElement) {
+      audioElement.muted = muted;
+      log.debug(`${muted ? 'Muted' : 'Unmuted'} audio for ${participantId}`);
+    } else {
+      log.warn(`No virtual audio element found for participant: ${participantId}`);
+    }
+  }
+
+  /**
+   * Subscribe to all tracks from an external participant
+   * @param participant - The external participant
+   */
+  async subscribeToAllTracks(participant: RemoteParticipant): Promise<void> {
+    const subscribePromises: Promise<void>[] = [];
+    
+    participant.tracks.forEach((publication) => {
+      if (publication instanceof RemoteTrackPublication && !publication.isSubscribed) {
+        subscribePromises.push(this.subscribeToTrack(publication, participant));
+      }
+    });
+    
+    await Promise.all(subscribePromises);
+    log.debug(`Subscribed to all tracks for participant: ${participant.identity}`);
+  }
+
+  /**
+   * Initialize the client for external participant support
+   * This sets up virtual audio mode and prepares the client for non-FVTT usage
+   */
+  initializeExternalParticipantSupport(): void {
+    this.setVirtualAudioMode(true);
+    log.info("LiveKit client initialized for external participant support");
+  }
+
+  /**
+   * Clean up all virtual audio elements and external participants
+   */
+  cleanupAllVirtualAudio(): void {
+    // Clean up all virtual audio elements
+    this.virtualAudioElements.forEach((element, elementId) => {
+      element.pause();
+      element.src = "";
+    });
+    this.virtualAudioElements.clear();
+
+    // Clear external participants
+    this.externalParticipants.clear();
+
+    log.debug("Cleaned up all virtual audio elements and external participants");
   }
 }
